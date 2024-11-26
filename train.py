@@ -178,7 +178,7 @@ def main():
     trainer = HandwritingTrainer(generator, discriminator, device)
     
     # Train the model
-    trainer.train(train_loader, num_epochs=50)
+    trainer.train(train_loader, num_epochs=100)
     
     return generator, discriminator
 
