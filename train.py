@@ -6,84 +6,105 @@ from torchvision import datasets, transforms
 import os
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+from PIL import Image
+import numpy as np
 
-# Generator Network
-class Generator(nn.Module):
-    def __init__(self, latent_dim=100):
-        super(Generator, self).__init__()
+class RNNGenerator(nn.Module):
+    def __init__(self, latent_dim=100, hidden_dim=256, num_layers=2):
+        super(RNNGenerator, self).__init__()
         
-        self.model = nn.Sequential(
-            # First layer
-            nn.Linear(latent_dim, 256),
-            nn.LeakyReLU(0.2),
-            nn.BatchNorm1d(256),
-            
-            # Second layer
-            nn.Linear(256, 512),
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        
+        self.rnn = nn.LSTM(
+            input_size=latent_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True
+        )
+        
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_dim, 512),
             nn.LeakyReLU(0.2),
             nn.BatchNorm1d(512),
             
-            # Third layer
             nn.Linear(512, 1024),
             nn.LeakyReLU(0.2),
             nn.BatchNorm1d(1024),
             
-            # Output layer
-            nn.Linear(1024, 784),  # 28x28 = 784
+            nn.Linear(1024, 784),
             nn.Tanh()
         )
         
-    def forward(self, z):
-        img = self.model(z)
-        img = img.view(img.size(0), 1, 28, 28)
-        return img
+    def forward(self, z, seq_length=1):
+        batch_size = z.size(0)
+        z = z.unsqueeze(1).repeat(1, seq_length, 1)
+        
+        lstm_out, _ = self.rnn(z)
+        lstm_out = lstm_out.contiguous().view(-1, self.hidden_dim)
+        
+        output = self.decoder(lstm_out)
+        output = output.view(batch_size, seq_length, 1, 28, 28)
+        return output
 
-# Discriminator Network
 class Discriminator(nn.Module):
     def __init__(self):
         super(Discriminator, self).__init__()
         
-        self.model = nn.Sequential(
-            # First layer
-            nn.Linear(784, 1024),
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 64, 4, 2, 1),
             nn.LeakyReLU(0.2),
-            nn.Dropout(0.3),
-            
-            # Second layer
-            nn.Linear(1024, 512),
+            nn.Conv2d(64, 128, 4, 2, 1),
+            nn.BatchNorm2d(128),
             nn.LeakyReLU(0.2),
-            nn.Dropout(0.3),
-            
-            # Third layer
-            nn.Linear(512, 256),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.3),
-            
-            # Output layer
-            nn.Linear(256, 1),
-            nn.Sigmoid()
+            nn.Conv2d(128, 256, 4, 2, 1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2)
         )
         
-    def forward(self, img):
-        img_flat = img.view(img.size(0), -1)
-        return self.model(img_flat)
+        # Calculate the size after convolutions
+        self.fc = nn.Sequential(
+            nn.Linear(256 * 3 * 3, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        x = self.conv(x)
+        x = x.view(x.size(0), -1)  # Flatten
+        return self.fc(x)
 
-# Trainer class
 class HandwritingTrainer:
     def __init__(self, generator, discriminator, device):
         self.generator = generator.to(device)
         self.discriminator = discriminator.to(device)
         self.device = device
         
-        # Optimizers
         self.g_optimizer = torch.optim.Adam(self.generator.parameters(), lr=0.0002, betas=(0.5, 0.999))
         self.d_optimizer = torch.optim.Adam(self.discriminator.parameters(), lr=0.0002, betas=(0.5, 0.999))
-        
-        # Loss function
         self.criterion = nn.BCELoss()
         
-        # Create directory for samples
         os.makedirs('samples', exist_ok=True)
+    
+    def generate_handwritten_page(self, num_chars=50, chars_per_row=10):
+        self.generator.eval()
+        with torch.no_grad():
+            noise = torch.randn(1, 100).to(self.device)
+            fake_chars = self.generator(noise, seq_length=num_chars)
+            fake_chars = fake_chars.squeeze(0)
+            
+            # Create a blank page
+            rows = (num_chars + chars_per_row - 1) // chars_per_row
+            page = Image.new('L', (28 * chars_per_row, 28 * rows), 255)
+            
+            for i in range(num_chars):
+                row = i // chars_per_row
+                col = i % chars_per_row
+                char_img = fake_chars[i].cpu().squeeze().numpy()
+                char_img = ((char_img + 1) * 127.5).astype(np.uint8)
+                char_pil = Image.fromarray(char_img)
+                page.paste(char_pil, (col * 28, row * 28))
+            
+            return page
     
     def train(self, dataloader, num_epochs):
         for epoch in range(num_epochs):
@@ -104,7 +125,7 @@ class HandwritingTrainer:
                     d_loss_real = self.criterion(output_real, label_real)
                     
                     noise = torch.randn(batch_size, 100).to(self.device)
-                    fake_images = self.generator(noise)
+                    fake_images = self.generator(noise).squeeze(1)
                     output_fake = self.discriminator(fake_images.detach())
                     d_loss_fake = self.criterion(output_fake, label_fake)
                     
@@ -123,62 +144,46 @@ class HandwritingTrainer:
                     running_g_loss += g_loss.item()
                     
                     if i % 100 == 0:
-                        # Save sample images
-                        with torch.no_grad():
-                            fake_images = self.generator(torch.randn(16, 100).to(self.device))
-                            self.save_images(fake_images, f'samples/fake_epoch_{epoch+1}_batch_{i}.png')
+                        page = self.generate_handwritten_page()
+                        page.save(f'samples/handwritten_page_epoch_{epoch+1}_batch_{i}.png')
                     
-                    # Update progress bar
                     pbar.set_postfix({
                         'D_loss': f'{d_loss.item():.4f}',
                         'G_loss': f'{g_loss.item():.4f}'
                     })
             
-            # Save models after each epoch
-            torch.save(self.generator.state_dict(), f'generator_epoch_{epoch+1}.pth')
-            torch.save(self.discriminator.state_dict(), f'discriminator_epoch_{epoch+1}.pth')
-            
-            # Print epoch statistics
             print(f'Epoch [{epoch+1}/{num_epochs}]')
             print(f'D_loss: {running_d_loss/len(dataloader):.4f}')
             print(f'G_loss: {running_g_loss/len(dataloader):.4f}')
-    
-    @staticmethod
-    def save_images(images, path):
-        plt.figure(figsize=(4, 4))
-        for i in range(16):
-            plt.subplot(4, 4, i+1)
-            plt.imshow(images[i].cpu().squeeze().numpy(), cmap='gray')
-            plt.axis('off')
-        plt.savefig(path)
-        plt.close()
 
 def main():
-    # Set random seed for reproducibility
     torch.manual_seed(42)
-    
-    # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'Using device: {device}')
     
-    # Load MNIST dataset
+    # Load EMNIST dataset (contains letters)
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.5,), (0.5,))
     ])
     
-    train_dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+    train_dataset = datasets.EMNIST(
+        root='./data',
+        split='letters',
+        train=True,
+        download=True,
+        transform=transform
+    )
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=2)
     
-    # Initialize models
-    generator = Generator()
+    generator = RNNGenerator()
     discriminator = Discriminator()
     
-    # Initialize trainer
     trainer = HandwritingTrainer(generator, discriminator, device)
+    trainer.train(train_loader, num_epochs=50)
     
-    # Train the model
-    trainer.train(train_loader, num_epochs=100)
+    # Generate final sample page
+    final_page = trainer.generate_handwritten_page(num_chars=100, chars_per_row=10)
+    final_page.save('final_handwritten_page.png')
     
     return generator, discriminator
 
