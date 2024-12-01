@@ -9,20 +9,61 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import numpy as np
 
-class RNNGenerator(nn.Module):
-    def __init__(self, latent_dim=100, hidden_dim=256, num_layers=2):
-        super(RNNGenerator, self).__init__()
+# Liquid Time Constant Module
+class LiquidTimeConstant(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.time_constant = nn.Parameter(torch.ones(hidden_size))
         
+    def forward(self, x):
+        return x * torch.sigmoid(self.time_constant).unsqueeze(0)
+
+# LF5 Cell
+class LF5Cell(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.hidden_size = hidden_size
+        
+        # Gates
+        self.Wf = nn.Linear(input_size + hidden_size, hidden_size)
+        self.Wi = nn.Linear(input_size + hidden_size, hidden_size)
+        self.Wc = nn.Linear(input_size + hidden_size, hidden_size)
+        self.Wo = nn.Linear(input_size + hidden_size, hidden_size)
+        
+        # Time constants
+        self.tau_f = LiquidTimeConstant(hidden_size)
+        self.tau_i = LiquidTimeConstant(hidden_size)
+        self.tau_c = LiquidTimeConstant(hidden_size)
+    
+    def forward(self, x, hidden):
+        h, c = hidden
+        combined = torch.cat((x, h), dim=1)
+        
+        f = torch.sigmoid(self.tau_f(self.Wf(combined)))
+        i = torch.sigmoid(self.tau_i(self.Wi(combined)))
+        c_tilde = torch.tanh(self.tau_c(self.Wc(combined)))
+        o = torch.sigmoid(self.Wo(combined))
+        
+        c = f * c + i * c_tilde
+        h = o * torch.tanh(c)
+        
+        return h, c
+
+# LF5 Generator
+class LF5Generator(nn.Module):
+    def __init__(self, latent_dim=100, hidden_dim=256, num_layers=2):
+        super().__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         
-        self.rnn = nn.LSTM(
-            input_size=latent_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True
-        )
+        # LF5 cells
+        self.lf5_cells = nn.ModuleList([
+            LF5Cell(latent_dim if i == 0 else hidden_dim, hidden_dim)
+            for i in range(num_layers)
+        ])
         
+        # Decoder network
         self.decoder = nn.Sequential(
             nn.Linear(hidden_dim, 512),
             nn.LeakyReLU(0.2),
@@ -35,34 +76,55 @@ class RNNGenerator(nn.Module):
             nn.Linear(1024, 784),
             nn.Tanh()
         )
-        
+    
     def forward(self, z, seq_length=1):
         batch_size = z.size(0)
+        device = z.device
+        
+        # Initialize hidden states
+        h_list = [torch.zeros(batch_size, self.hidden_dim, device=device) 
+                 for _ in range(self.num_layers)]
+        c_list = [torch.zeros(batch_size, self.hidden_dim, device=device) 
+                 for _ in range(self.num_layers)]
+        
+        outputs = []
         z = z.unsqueeze(1).repeat(1, seq_length, 1)
         
-        lstm_out, _ = self.rnn(z)
-        lstm_out = lstm_out.contiguous().view(-1, self.hidden_dim)
+        for t in range(seq_length):
+            input_t = z[:, t, :]
+            
+            for layer in range(self.num_layers):
+                if layer == 0:
+                    h, c = self.lf5_cells[layer](input_t, (h_list[layer], c_list[layer]))
+                else:
+                    h, c = self.lf5_cells[layer](h, (h_list[layer], c_list[layer]))
+                h_list[layer] = h
+                c_list[layer] = c
+            
+            out = self.decoder(h)
+            outputs.append(out)
         
-        output = self.decoder(lstm_out)
-        output = output.view(batch_size, seq_length, 1, 28, 28)
-        return output
+        outputs = torch.stack(outputs, dim=1)
+        return outputs.view(batch_size, seq_length, 1, 28, 28)
 
+# Discriminator Network
 class Discriminator(nn.Module):
     def __init__(self):
-        super(Discriminator, self).__init__()
+        super().__init__()
         
         self.conv = nn.Sequential(
             nn.Conv2d(1, 64, 4, 2, 1),
             nn.LeakyReLU(0.2),
+            
             nn.Conv2d(64, 128, 4, 2, 1),
             nn.BatchNorm2d(128),
             nn.LeakyReLU(0.2),
+            
             nn.Conv2d(128, 256, 4, 2, 1),
             nn.BatchNorm2d(256),
             nn.LeakyReLU(0.2)
         )
         
-        # Calculate the size after convolutions
         self.fc = nn.Sequential(
             nn.Linear(256 * 3 * 3, 1),
             nn.Sigmoid()
@@ -70,20 +132,30 @@ class Discriminator(nn.Module):
     
     def forward(self, x):
         x = self.conv(x)
-        x = x.view(x.size(0), -1)  # Flatten
+        x = x.view(x.size(0), -1)
         return self.fc(x)
 
+# Handwriting Trainer
 class HandwritingTrainer:
-    def __init__(self, generator, discriminator, device):
+    def __init__(self, generator, discriminator, device, model_name):
         self.generator = generator.to(device)
         self.discriminator = discriminator.to(device)
         self.device = device
+        self.model_name = model_name
         
-        self.g_optimizer = torch.optim.Adam(self.generator.parameters(), lr=0.0002, betas=(0.5, 0.999))
-        self.d_optimizer = torch.optim.Adam(self.discriminator.parameters(), lr=0.0002, betas=(0.5, 0.999))
+        self.g_optimizer = torch.optim.Adam(
+            self.generator.parameters(), 
+            lr=0.0002, 
+            betas=(0.5, 0.999)
+        )
+        self.d_optimizer = torch.optim.Adam(
+            self.discriminator.parameters(), 
+            lr=0.0002, 
+            betas=(0.5, 0.999)
+        )
+        
         self.criterion = nn.BCELoss()
-        
-        os.makedirs('samples', exist_ok=True)
+        os.makedirs(f'samples_{model_name}', exist_ok=True)
     
     def generate_handwritten_page(self, num_chars=50, chars_per_row=10):
         self.generator.eval()
@@ -92,7 +164,7 @@ class HandwritingTrainer:
             fake_chars = self.generator(noise, seq_length=num_chars)
             fake_chars = fake_chars.squeeze(0)
             
-            # Create a blank page
+            # Create page
             rows = (num_chars + chars_per_row - 1) // chars_per_row
             page = Image.new('L', (28 * chars_per_row, 28 * rows), 255)
             
@@ -145,7 +217,7 @@ class HandwritingTrainer:
                     
                     if i % 100 == 0:
                         page = self.generate_handwritten_page()
-                        page.save(f'samples/handwritten_page_epoch_{epoch+1}_batch_{i}.png')
+                        page.save(f'samples_{self.model_name}/page_epoch_{epoch+1}_batch_{i}.png')
                     
                     pbar.set_postfix({
                         'D_loss': f'{d_loss.item():.4f}',
@@ -155,12 +227,20 @@ class HandwritingTrainer:
             print(f'Epoch [{epoch+1}/{num_epochs}]')
             print(f'D_loss: {running_d_loss/len(dataloader):.4f}')
             print(f'G_loss: {running_g_loss/len(dataloader):.4f}')
+            
+            # Save models
+            torch.save(self.generator.state_dict(), 
+                      f'{self.model_name}_generator_epoch_{epoch+1}.pth')
+            torch.save(self.discriminator.state_dict(), 
+                      f'{self.model_name}_discriminator_epoch_{epoch+1}.pth')
 
 def main():
+    # Setup
     torch.manual_seed(42)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
     
-    # Load EMNIST dataset (contains letters)
+    # Data loading
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.5,), (0.5,))
@@ -173,19 +253,30 @@ def main():
         download=True,
         transform=transform
     )
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=2)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=64, 
+        shuffle=True, 
+        num_workers=2
+    )
     
-    generator = RNNGenerator()
+    # Initialize models
+    lf5_generator = LF5Generator()
     discriminator = Discriminator()
     
-    trainer = HandwritingTrainer(generator, discriminator, device)
-    trainer.train(train_loader, num_epochs=50)
+    # Train LF5 model
+    print("\nTraining LF5 Generator...")
+    lf5_trainer = HandwritingTrainer(lf5_generator, discriminator, device, "lf5")
+    lf5_trainer.train(train_loader, num_epochs=100)
     
-    # Generate final sample page
-    final_page = trainer.generate_handwritten_page(num_chars=100, chars_per_row=10)
-    final_page.save('final_handwritten_page.png')
+    # Generate final samples
+    final_page = lf5_trainer.generate_handwritten_page(
+        num_chars=100, 
+        chars_per_row=10
+    )
+    final_page.save('final_lf5_handwritten_page.png')
     
-    return generator, discriminator
+    return lf5_generator, discriminator
 
 if __name__ == '__main__':
     generator, discriminator = main()
