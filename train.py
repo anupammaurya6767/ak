@@ -240,25 +240,47 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Data loading
+    # Create data directory if it doesn't exist
+    os.makedirs('./data', exist_ok=True)
+    
+    # Data loading with error handling
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.5,), (0.5,))
     ])
     
-    train_dataset = datasets.EMNIST(
-        root='./data',
-        split='letters',
-        train=True,
-        download=True,
-        transform=transform
-    )
+    try:
+        print("Downloading and loading EMNIST dataset...")
+        train_dataset = datasets.EMNIST(
+            root='./data',
+            split='letters',
+            train=True,
+            download=True,
+            transform=transform
+        )
+    except RuntimeError as e:
+        print(f"Error downloading EMNIST dataset: {e}")
+        print("Attempting to use MNIST dataset instead...")
+        try:
+            train_dataset = datasets.MNIST(
+                root='./data',
+                train=True,
+                download=True,
+                transform=transform
+            )
+        except Exception as e:
+            print(f"Error downloading MNIST dataset: {e}")
+            print("Please check your internet connection and directory permissions")
+            return None, None
+    
     train_loader = DataLoader(
         train_dataset, 
         batch_size=64, 
         shuffle=True, 
         num_workers=2
     )
+    
+    # Rest of the code remains the same...
     
     # Initialize models
     lf5_generator = LF5Generator()
