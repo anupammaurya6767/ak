@@ -91,8 +91,8 @@ def test_model():
         
         # Load the trained weights
         print("Loading trained weights...")
-        generator.load_state_dict(torch.load('generator_epoch_50.pth', map_location=device))
-        discriminator.load_state_dict(torch.load('discriminator_epoch_50.pth', map_location=device))
+        generator.load_state_dict(torch.load('generator_epoch_100.pth', map_location=device))
+        discriminator.load_state_dict(torch.load('discriminator_epoch_100.pth', map_location=device))
         
         # Initialize evaluator
         print("Initializing evaluator...")
